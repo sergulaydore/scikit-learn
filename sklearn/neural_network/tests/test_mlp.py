@@ -197,6 +197,7 @@ def test_gradient():
             deltas = []
             coef_grads = []
             intercept_grads = []
+            dropout_masks = {}
 
             activations.append(X)
             for i in range(mlp.n_layers_ - 1):
@@ -212,8 +213,9 @@ def test_gradient():
 
             # analytically compute the gradients
             def loss_grad_fun(t):
-                return mlp._loss_grad_lbfgs(t, X, Y, activations, deltas,
-                                            coef_grads, intercept_grads)
+                return mlp._loss_grad_lbfgs(
+                    t, X, Y, activations, deltas, coef_grads, intercept_grads,
+                    dropout_masks)
 
             [value, grad] = loss_grad_fun(theta)
             numgrad = np.zeros(np.size(theta))
@@ -227,6 +229,73 @@ def test_gradient():
                               loss_grad_fun(theta - dtheta)[0]) /
                               (epsilon * 2.0))
             assert_almost_equal(numgrad, grad)
+
+
+def test_gradient_with_dropout():
+    # Test gradient with dropout
+
+    # This makes sure that the activation functions and their derivatives
+    # are correct. The numerical and analytical computation of the gradient
+    # should be close.
+    for n_labels in [2, 3]:
+        n_samples = 5
+        n_features = 10
+        X = np.random.random((n_samples, n_features))
+        y = 1 + np.mod(np.arange(n_samples) + 1, n_labels)
+        Y = LabelBinarizer().fit_transform(y)
+
+        for activation in ACTIVATION_TYPES:
+            for dropout in [[0, 0.5], [0.5, 0.5], [0.5, 0], [0, 0]]:
+                mlp = MLPClassifier(activation=activation,
+                                    hidden_layer_sizes=10,
+                                    solver='lbfgs', alpha=1e-5,
+                                    learning_rate_init=0.2, max_iter=1,
+                                    random_state=1, dropout=dropout)
+                mlp.fit(X, y)
+
+                theta = np.hstack([l.ravel() for l in mlp.coefs_ +
+                                   mlp.intercepts_])
+
+                layer_units = ([X.shape[1]] + [mlp.hidden_layer_sizes] +
+                               [mlp.n_outputs_])
+
+                activations = []
+                deltas = []
+                coef_grads = []
+                intercept_grads = []
+                dropout_masks = {}
+
+                activations.append(X)
+                for i in range(mlp.n_layers_ - 1):
+                    activations.append(np.empty((X.shape[0],
+                                                 layer_units[i + 1])))
+                    deltas.append(np.empty((X.shape[0],
+                                            layer_units[i + 1])))
+
+                    fan_in = layer_units[i]
+                    fan_out = layer_units[i + 1]
+                    coef_grads.append(np.empty((fan_in, fan_out)))
+                    intercept_grads.append(np.empty(fan_out))
+
+                # analytically compute the gradients
+                def loss_grad_fun(t):
+                    mlp._random_state = np.random.RandomState(1)
+                    return mlp._loss_grad_lbfgs(
+                        t, X, Y, activations, deltas, coef_grads,
+                        intercept_grads, dropout_masks)
+
+                [value, grad] = loss_grad_fun(theta)
+                numgrad = np.zeros(np.size(theta))
+                n = np.size(theta, 0)
+                E = np.eye(n)
+                epsilon = 1e-5
+                # numerically compute the gradients
+                for i in range(n):
+                    dtheta = E[:, i] * epsilon
+                    numgrad[i] = ((loss_grad_fun(theta + dtheta)[0] -
+                                   loss_grad_fun(theta - dtheta)[0]) /
+                                  (epsilon * 2.0))
+                assert_almost_equal(numgrad, grad)
 
 
 def test_lbfgs_classification():
@@ -424,6 +493,9 @@ def test_params_errors():
     assert_raises(ValueError, clf(solver='hadoken').fit, X, y)
     assert_raises(ValueError, clf(learning_rate='converge').fit, X, y)
     assert_raises(ValueError, clf(activation='cloak').fit, X, y)
+    assert_raises(ValueError, clf(dropout=[1.]).fit, X, y)
+    assert_raises(ValueError, clf(dropout=[-1]).fit, X, y)
+    assert_raises(ValueError, clf(dropout=[0.5]).fit, X, y)
 
 
 def test_predict_proba_binary():
@@ -495,20 +567,42 @@ def test_predict_proba_multilabel():
 
 
 def test_sparse_matrices():
-    # Test that sparse and dense input matrices output the same results.
+    # Test that sparse and dense input matrices output the same results when
+    # there's no dropout
     X = X_digits_binary[:50]
     y = y_digits_binary[:50]
     X_sparse = csr_matrix(X)
     mlp = MLPClassifier(solver='lbfgs', hidden_layer_sizes=15,
                         random_state=1)
     mlp.fit(X, y)
-    pred1 = mlp.predict(X)
+    pred1 = mlp.predict_proba(X)
     mlp.fit(X_sparse, y)
-    pred2 = mlp.predict(X_sparse)
+    pred2 = mlp.predict_proba(X_sparse)
     assert_almost_equal(pred1, pred2)
-    pred1 = mlp.predict(X)
-    pred2 = mlp.predict(X_sparse)
-    assert_array_equal(pred1, pred2)
+    pred1 = mlp.predict_proba(X)
+    pred2 = mlp.predict_proba(X_sparse)
+    assert_almost_equal(pred1, pred2)
+
+
+def test_sparse_matrices_with_dropout():
+    # With dropout, as the way we sample dropout masks is different when having
+    # sparse input, random factors differ as training goes, and the trained
+    # model is expected to be different. So we only check if predicitions are
+    # equal for the same trained model
+    X = X_digits_binary[:50]
+    y = y_digits_binary[:50]
+    X_sparse = csr_matrix(X)
+    for solver in ['lbfgs', 'sgd', 'adam']:
+        mlp = MLPClassifier(solver=solver, hidden_layer_sizes=15,
+                            random_state=1, dropout=[0.5, 0.5])
+        mlp.fit(X, y)
+        pred1 = mlp.predict_proba(X)
+        pred2 = mlp.predict_proba(X_sparse)
+        assert_almost_equal(pred1, pred2)
+        mlp.fit(X_sparse, y)
+        pred1 = mlp.predict_proba(X)
+        pred2 = mlp.predict_proba(X_sparse)
+        assert_almost_equal(pred1, pred2)
 
 
 def test_tolerance():
